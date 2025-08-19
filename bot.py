@@ -17,6 +17,7 @@ SEL_DETALLE = (By.CSS_SELECTOR, "#expediente, .detalle-expediente")
 SEL_FILAS_TABLA  = (By.CSS_SELECTOR, "table.tab-docs tbody tr")
 SEL_COL_ESTADO   = (By.CSS_SELECTOR, "table.tab-docs tbody tr td:nth-child(6)")
 SEL_TBODY        = (By.CSS_SELECTOR, "table.tab-docs tbody")
+DEFAULT_TIMEOUT = 120
 
 # -----------------------------------------------------------------------------
 # LOGIN
@@ -28,7 +29,7 @@ def esperar_login_e_ir_a_seguimiento(driver):
     WebDriverWait(driver, 600).until(EC.presence_of_element_located(SEL_SEGUIMIENTO))
     print("->Login detectado, dando click en Seguimiento")
     driver.find_element(*SEL_SEGUIMIENTO).click()
-    WebDriverWait(driver, 20).until(EC.url_contains("/listado/seguimiento"))
+    WebDriverWait(driver, DEFAULT_TIMEOUT ).until(EC.url_contains("/listado/seguimiento"))
     print("->Estamos en la sección de Seguimiento")
 
 
@@ -39,7 +40,7 @@ def norm(s: str) -> str:
 # FILTROS
 # -----------------------------------------------------------------------------
 
-def cambiar_mostrar_100(driver, timeout=8):
+def cambiar_mostrar_100(driver, timeout=DEFAULT_TIMEOUT ):
     wait = WebDriverWait(driver, timeout)
 
     select_el = wait.until(
@@ -67,7 +68,7 @@ def cambiar_mostrar_100(driver, timeout=8):
     wait.until(lambda d: len(d.find_elements(*SEL_FILAS_TABLA)) > 10)
     print("-> El tamaño de la página fue ajustado a 100 registros")
 
-def seleccionar_filtro_por_estado(driver, valor="Entrega electrónica y física de documentos", timeout=20):
+def seleccionar_filtro_por_estado(driver, valor="Entrega electrónica y física de documentos", timeout=DEFAULT_TIMEOUT):
     wait = WebDriverWait(driver, timeout)
     valor_norm = norm(valor)
 
@@ -89,7 +90,7 @@ def seleccionar_filtro_por_estado(driver, valor="Entrega electrónica y física 
     wait.until(ok)
     print("-> Filtro aplicado")
 
-    cambiar_mostrar_100(driver, timeout=8)
+    cambiar_mostrar_100(driver, timeout=DEFAULT_TIMEOUT )
 
 # -----------------------------------------------------------------------------
 # OBTENER URL DIRECTA
@@ -131,7 +132,7 @@ def _obtener_url_expediente_desde_fila(driver, fila):
 # EXTRAER VALORES
 # -----------------------------------------------------------------------------
 
-def obtener_valor(driver, label_text, timeout=20):
+def obtener_valor(driver, label_text, timeout=DEFAULT_TIMEOUT ):
     wait = WebDriverWait(driver, timeout)
     xp = f'//div[normalize-space()="{label_text}"]/following-sibling::div[1]'
     el = wait.until(EC.visibility_of_element_located((By.XPATH, xp)))
@@ -168,7 +169,7 @@ def obtener_cita_programada_instant(driver):
 # ABRIR EXPEDIENTE EN NUEVA PESTAÑA
 # -----------------------------------------------------------------------------
 
-def abrir_y_extraer_en_pestana_nueva(driver, url, timeout=20):
+def abrir_y_extraer_en_pestana_nueva(driver, url, timeout=DEFAULT_TIMEOUT ):
     original = driver.current_window_handle
 
     driver.switch_to.new_window('tab')
@@ -195,7 +196,7 @@ def abrir_y_extraer_en_pestana_nueva(driver, url, timeout=20):
 # PAGINACION Y RECORRER EXPEDIENTES
 # -----------------------------------------------------------------------------
 
-def _ir_a_siguiente_pagina(driver, timeout=12):
+def _ir_a_siguiente_pagina(driver, timeout=DEFAULT_TIMEOUT ):
     wait = WebDriverWait(driver, timeout)
 
     candidatos = driver.find_elements(
