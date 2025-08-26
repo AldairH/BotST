@@ -1,6 +1,8 @@
 import re
 import json
+import time
 import pandas as pd
+import requests
 from datetime import datetime
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
@@ -9,7 +11,15 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+# -----------------------------------------------------------------------------
+# CONFIG / SELECTORES
+# -----------------------------------------------------------------------------
 URL = "https://seguimientotitulacion.unam.mx/control/login"
 SEL_SEGUIMIENTO = (By.XPATH, "//a[normalize-space()='Seguimiento']")
 SEL_FILAS   = (By.CSS_SELECTOR, "table.tab-docs tbody tr")
@@ -19,22 +29,38 @@ SEL_COL_ESTADO   = (By.CSS_SELECTOR, "table.tab-docs tbody tr td:nth-child(6)")
 SEL_TBODY        = (By.CSS_SELECTOR, "table.tab-docs tbody")
 DEFAULT_TIMEOUT = 120
 
+MAX_WORKERS = 6
+
+# -----------------------------------------------------------------------------
+# UTILS
+# -----------------------------------------------------------------------------
+def norm(s: str) -> str:
+    return " ".join((s or "").split())
+
+def dominio_base(url_actual: str) -> str:
+    p = urlparse(url_actual)
+    return f"{p.scheme}://{p.netloc}/"
+
+def asegurar_url_absoluta(driver, posible_url: str) -> str:
+    if not posible_url:
+        return posible_url
+    if posible_url.startswith("http://") or posible_url.startswith("https://"):
+        return posible_url
+    base = dominio_base(driver.current_url or URL)
+    return urljoin(base, posible_url)
+
 # -----------------------------------------------------------------------------
 # LOGIN
 # -----------------------------------------------------------------------------
 
 def esperar_login_e_ir_a_seguimiento(driver):
     driver.get(URL)
-    print("->Inicia sesión manualmente")
+    print("-> Inicia sesión manualmente")
     WebDriverWait(driver, 600).until(EC.presence_of_element_located(SEL_SEGUIMIENTO))
-    print("->Login detectado, dando click en Seguimiento")
+    print("-> Login detectado, dando click en Seguimiento")
     driver.find_element(*SEL_SEGUIMIENTO).click()
-    WebDriverWait(driver, DEFAULT_TIMEOUT ).until(EC.url_contains("/listado/seguimiento"))
-    print("->Estamos en la sección de Seguimiento")
-
-
-def norm(s: str) -> str:
-    return " ".join((s or "").split())
+    WebDriverWait(driver, DEFAULT_TIMEOUT).until(EC.url_contains("/listado/seguimiento"))
+    print("-> Estamos en la sección de Seguimiento")
 
 # -----------------------------------------------------------------------------
 # FILTROS
@@ -93,7 +119,7 @@ def seleccionar_filtro_por_estado(driver, valor="Entrega electrónica y física 
     cambiar_mostrar_100(driver, timeout=DEFAULT_TIMEOUT )
 
 # -----------------------------------------------------------------------------
-# OBTENER URL DIRECTA
+# OBTENER URL DIRECTA DESDE LA FILA
 # -----------------------------------------------------------------------------
 
 def _obtener_url_expediente_desde_fila(driver, fila):
@@ -126,75 +152,107 @@ def _obtener_url_expediente_desde_fila(driver, fila):
 
     if not url:
         raise RuntimeError("No se puede derivar la URL del expediente desde los atributos del boton")
-    return url
+    return asegurar_url_absoluta(driver, url)
 
 # -----------------------------------------------------------------------------
-# EXTRAER VALORES
+# SESSION REQUESTS + RETRIES/POOL
 # -----------------------------------------------------------------------------
+def construir_session_desde_driver(driver):
+    s = requests.Session()
+    ua = driver.execute_script("return navigator.userAgent;")
+    s.headers.update({
+        "User-Agent": ua,
+        "Accept-Language": "es-ES,es;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+    })
+    for c in driver.get_cookies():
+        s.cookies.set(c.get("name"), c.get("value"), domain=c.get("domain"), path=c.get("path", "/"))
+    return s
 
-def obtener_valor(driver, label_text, timeout=DEFAULT_TIMEOUT ):
-    wait = WebDriverWait(driver, timeout)
-    xp = f'//div[normalize-space()="{label_text}"]/following-sibling::div[1]'
-    el = wait.until(EC.visibility_of_element_located((By.XPATH, xp)))
-    return el.text.strip()
-
-
-def extraer_expediente(driver):
-    return {
-        "numero_cuenta":     obtener_valor(driver, "Número de cuenta:"),
-        "nombre":            obtener_valor(driver, "Nombre:"),
-        "opcion_titulacion": obtener_valor(driver, "Opción de titulación:"),
-        "correo":            obtener_valor(driver, "Correo electrónico:"),
-        "plantel":           obtener_valor(driver, "Plantel:"),
-        "carrera":           obtener_valor(driver, "Carrera:"),
-        "plan_estudios":     obtener_valor(driver, "Plan de estudios:"),
-    }
+def preparar_session(session: requests.Session) -> requests.Session:
+    retry = Retry(total=3, backoff_factor=0.8, status_forcelist=[429, 503, 502, 504])
+    adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 # -----------------------------------------------------------------------------
-# EXTRAER CITA
+# HELPERS BS4
 # -----------------------------------------------------------------------------
+def bs4_obtener_valor(html_soup: BeautifulSoup, label_text: str) -> str:
+    def _norm(s): return " ".join((s or "").split())
+    for div in html_soup.select("div"):
+        if _norm(div.get_text()) == label_text:
+            sib = div.find_next_sibling()
+            if sib:
+                return _norm(sib.get_text())
+            break
+    return ""
 
-def obtener_cita_programada_instant(driver):
-    container_xpath = ("//div[contains(@class,'bg-emerald-50') "
-                       "and .//text()[contains(.,'Cita programada')]]")
-    conts = driver.find_elements(By.XPATH, container_xpath)
-    if not conts:
+def bs4_obtener_cita_programada(html_soup: BeautifulSoup):
+    def _norm(s): return " ".join((s or "").split())
+    candidatos = html_soup.select("div.bg-emerald-50, div[class*='bg-emerald-50']")
+    for cont in candidatos:
+        t = _norm(cont.get_text(" "))
+        if "Cita programada" in t:
+            return {"cita_fecha": t}
+    texto = _norm(html_soup.get_text(" "))
+    if "Cita programada" in texto:
+        return {"cita_fecha": "Cita programada (detalle no localizado)"}
+    return None
+# -----------------------------------------------------------------------------
+# DESCARGA + PARSEO DEL EXPEDIENTE
+# -----------------------------------------------------------------------------
+def descargar_y_extraer_expediente(session: requests.Session, url: str):
+    r = session.get(url, timeout=30)
+    if r.status_code in (401, 403):
+        raise PermissionError(f"Sesión expirada o sin permisos al pedir {url}")
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "lxml")
+
+    cita = bs4_obtener_cita_programada(soup)
+    if not cita:
         return None
 
-    cont = conts[0]
-    texto_cita = norm(cont.text)
-    return {"cita_fecha": texto_cita}
-
-# -----------------------------------------------------------------------------
-# ABRIR EXPEDIENTE EN NUEVA PESTAÑA
-# -----------------------------------------------------------------------------
-
-def abrir_y_extraer_en_pestana_nueva(driver, url, timeout=DEFAULT_TIMEOUT ):
-    original = driver.current_window_handle
-
-    driver.switch_to.new_window('tab')
-    driver.get(url)
-
-    WebDriverWait(driver, timeout).until(
-        EC.any_of(EC.url_contains("/expediente"), EC.presence_of_element_located(SEL_DETALLE))
-    )
-
-    cita = obtener_cita_programada_instant(driver)
-    datos = None
-    if cita:
-        base = extraer_expediente(driver)
-        base.update(cita)
-        datos = base
-    else:
-        print("   -> Expediente sin cita programada, omitido")
-
-    driver.close()
-    driver.switch_to.window(original)
+    datos = {
+        "numero_cuenta":     bs4_obtener_valor(soup, "Número de cuenta:"),
+        "nombre":            bs4_obtener_valor(soup, "Nombre:"),
+        "opcion_titulacion": bs4_obtener_valor(soup, "Opción de titulación:"),
+        "correo":            bs4_obtener_valor(soup, "Correo electrónico:"),
+        "plantel":           bs4_obtener_valor(soup, "Plantel:"),
+        "carrera":           bs4_obtener_valor(soup, "Carrera:"),
+        "plan_estudios":     bs4_obtener_valor(soup, "Plan de estudios:"),
+    }
+    datos.update(cita)
     return datos
 
 # -----------------------------------------------------------------------------
-# PAGINACION Y RECORRER EXPEDIENTES
+# FASE A: RECOLECTAR TODAS LAS URLs
 # -----------------------------------------------------------------------------
+def recolectar_urls_expedientes(driver):
+    urls, vistos = [], set()
+    pagina = 1
+    while True:
+        filas = driver.find_elements(*SEL_FILAS)
+        total = len(filas)
+        print(f"\n== Página {pagina}: {total} filas ==")
+
+        for fila in filas:
+            try:
+                url = _obtener_url_expediente_desde_fila(driver, fila)
+                if url not in vistos:
+                    urls.append(url)
+                    vistos.add(url)
+            except Exception as e:
+                print(f"   -> No se pudo derivar URL de una fila: {e}")
+
+        avanzo = _ir_a_siguiente_pagina(driver)
+        if not avanzo:
+            break
+        pagina += 1
+    return urls
 
 def _ir_a_siguiente_pagina(driver, timeout=DEFAULT_TIMEOUT ):
     wait = WebDriverWait(driver, timeout)
@@ -231,43 +289,40 @@ def _ir_a_siguiente_pagina(driver, timeout=DEFAULT_TIMEOUT ):
 
     return True
 
-def recorrer_expedientes(driver):
-    resultados = []
-    omitidos = 0
-    vistos = set()
-    pagina = 1
-    while True:
-        filas = driver.find_elements(*SEL_FILAS)
-        total = len(filas)
-        print(f"\n== Página {pagina}: {total} filas ==")
+# -----------------------------------------------------------------------------
+# FASE B: PROCESAR EN PARALELO
+# -----------------------------------------------------------------------------
+def procesar_urls_concurrente(driver, session, urls, max_workers=MAX_WORKERS):
+    resultados, omitidos = [], 0
+    session = preparar_session(session)
 
-        for i in range(total):
-            filas = driver.find_elements(*SEL_FILAS)
-            fila = filas[i]
+    def tarea(u):
+        try:
+            return descargar_y_extraer_expediente(session, u)
+        except PermissionError:
+            # renovar cookies y reintentar una vez
+            s2 = preparar_session(construir_session_desde_driver(driver))
+            return descargar_y_extraer_expediente(s2, u)
 
-            url = _obtener_url_expediente_desde_fila(driver, fila)
-            if url in vistos:
-                continue
-
-            datos = abrir_y_extraer_en_pestana_nueva(driver, url)
-            if datos:
-                resultados.append(datos)
-                vistos.add(url)
-            else:
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(tarea, u): u for u in urls}
+        for fut in as_completed(futs):
+            u = futs[fut]
+            try:
+                datos = fut.result()
+                if datos:
+                    resultados.append(datos)
+                else:
+                    omitidos += 1
+            except Exception as e:
+                print(f"   -> Error en {u}: {e}")
                 omitidos += 1
 
-        avanzo = _ir_a_siguiente_pagina(driver)
-        if not avanzo:
-            break
-        pagina += 1
-
-    print(f"\n-> Expedientes guardados: {len(resultados)} | Omitidos (sin cita): {omitidos}")
-    return resultados
+    return resultados, omitidos
 
 # -----------------------------------------------------------------------------
-# EXPORTAR A EXVEL
+# EXPORTAR
 # -----------------------------------------------------------------------------
-
 def exportar_excel(resultados, base="expedientes", tz="America/Mexico_City"):
 
     schema = [
@@ -312,9 +367,8 @@ def exportar_excel(resultados, base="expedientes", tz="America/Mexico_City"):
         print(f"-> CSV de respaldo generado: {ruta_csv}")
 
 # -----------------------------------------------------------------------------
-# ESTRUCTURA FINAL
+# MAIN
 # -----------------------------------------------------------------------------
-
 def main():
     options = webdriver.ChromeOptions()
     options.page_load_strategy = 'eager'
@@ -326,20 +380,29 @@ def main():
     )
     try:
         esperar_login_e_ir_a_seguimiento(driver)
-
         seleccionar_filtro_por_estado(driver)
         print(f"-> Filas visibles: {len(driver.find_elements(*SEL_FILAS_TABLA))}")
 
-        resultados = recorrer_expedientes(driver)
+        # FASE A: recolectar todas las URLs
+        urls = recolectar_urls_expedientes(driver)
+        print(f"-> Total URLs recolectadas: {len(urls)}")
+
+        session = construir_session_desde_driver(driver)
+
+        # FASE B: procesar en paralelo
+        resultados, omitidos = procesar_urls_concurrente(driver, session, urls, max_workers=MAX_WORKERS)
+        print(f"\n-> Expedientes guardados: {len(resultados)} | Omitidos (sin cita/errores): {omitidos}")
+
         exportar_excel(resultados, base="expedientes")
 
         with open("expedientes.json", "w", encoding="utf-8") as f:
             json.dump(resultados, f, ensure_ascii=False, indent=4)
-
         print("\n-> Datos guardados en expedientes.json")
     finally:
-        driver.quit()
-
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
