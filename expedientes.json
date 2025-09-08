@@ -1,0 +1,42 @@
+[
+    {
+        "numero_cuenta": "318035169",
+        "nombre": "CARLO IKER GONZALEZ YAÑEZ",
+        "opcion_titulacion": "TOTALIDAD DE CRÉDITOS Y ALTO NIVEL ACADÉMICO",
+        "correo": "carloyanez69@aragon.unam.mx",
+        "plantel": "411 - F.E.S. ARAGON (INGENIERIA)",
+        "carrera": "110 - INGENIERIA EN COMPUTACION",
+        "plan_estudios": "2119 - ING EN COMPUTACION",
+        "cita_fecha": "Cita programada Fecha: 09/09/2025 Horario: 17:15 - 17:30"
+    },
+    {
+        "numero_cuenta": "313250860",
+        "nombre": "GERARDO AARON PLATA HERNANDEZ",
+        "opcion_titulacion": "AMPLIACIÓN Y PROFUNDIZACIÓN DE CONOCIMIENTOS EN SU ALTERNATIVA DE CURSOS O DIPLOMADOS DE EDUCACIÓN CONTINUA",
+        "correo": "arnplatah@gmail.com",
+        "plantel": "411 - F.E.S. ARAGON (INGENIERIA)",
+        "carrera": "110 - INGENIERIA EN COMPUTACION",
+        "plan_estudios": "1279 - ING EN COMPUTACION",
+        "cita_fecha": "Cita programada Fecha: 09/09/2025 Horario: 16:00 - 16:15"
+    },
+    {
+        "numero_cuenta": "309270953",
+        "nombre": "GUSTAVO SANTIAGO MIGUEL",
+        "opcion_titulacion": "AMPLIACIÓN Y PROFUNDIZACIÓN DE CONOCIMIENTOS EN SU ALTERNATIVA DE CURSOS O DIPLOMADOS DE EDUCACIÓN CONTINUA",
+        "correo": "santimiguelgus93@gmail.com",
+        "plantel": "411 - F.E.S. ARAGON (INGENIERIA)",
+        "carrera": "110 - INGENIERIA EN COMPUTACION",
+        "plan_estudios": "1279 - ING EN COMPUTACION",
+        "cita_fecha": "Cita programada Fecha: 09/09/2025 Horario: 18:15 - 18:30"
+    },
+    {
+        "numero_cuenta": "315219908",
+        "nombre": "RAYMUNDO NAVA VARGAS",
+        "opcion_titulacion": "TOTALIDAD DE CRÉDITOS Y ALTO NIVEL ACADÉMICO",
+        "correo": "raymundonava315@aragon.unam.mx",
+        "plantel": "411 - F.E.S. ARAGON (INGENIERIA)",
+        "carrera": "110 - INGENIERIA EN COMPUTACION",
+        "plan_estudios": "2119 - ING EN COMPUTACION",
+        "cita_fecha": "Cita programada Fecha: 12/09/2025 Horario: 09:30 - 09:45"
+    }
+]

@@ -2,8 +2,8 @@ import re
 import json
 import time
 import pandas as pd
-import requests
 from datetime import datetime
+
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -11,11 +11,11 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
+
+# === NUEVO: scraping directo ===
+import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # -----------------------------------------------------------------------------
 # CONFIG / SELECTORES
@@ -28,8 +28,6 @@ SEL_FILAS_TABLA  = (By.CSS_SELECTOR, "table.tab-docs tbody tr")
 SEL_COL_ESTADO   = (By.CSS_SELECTOR, "table.tab-docs tbody tr td:nth-child(6)")
 SEL_TBODY        = (By.CSS_SELECTOR, "table.tab-docs tbody")
 DEFAULT_TIMEOUT = 120
-
-MAX_WORKERS = 6
 
 # -----------------------------------------------------------------------------
 # UTILS
@@ -52,7 +50,6 @@ def asegurar_url_absoluta(driver, posible_url: str) -> str:
 # -----------------------------------------------------------------------------
 # LOGIN
 # -----------------------------------------------------------------------------
-
 def esperar_login_e_ir_a_seguimiento(driver):
     driver.get(URL)
     print("-> Inicia sesión manualmente")
@@ -65,7 +62,6 @@ def esperar_login_e_ir_a_seguimiento(driver):
 # -----------------------------------------------------------------------------
 # FILTROS
 # -----------------------------------------------------------------------------
-
 def cambiar_mostrar_100(driver, timeout=DEFAULT_TIMEOUT ):
     wait = WebDriverWait(driver, timeout)
 
@@ -121,7 +117,6 @@ def seleccionar_filtro_por_estado(driver, valor="Entrega electrónica y física 
 # -----------------------------------------------------------------------------
 # OBTENER URL DIRECTA DESDE LA FILA
 # -----------------------------------------------------------------------------
-
 def _obtener_url_expediente_desde_fila(driver, fila):
     candidatos = fila.find_elements(By.CSS_SELECTOR, "td:last-child button.btn-accion")
     btn = None
@@ -155,10 +150,11 @@ def _obtener_url_expediente_desde_fila(driver, fila):
     return asegurar_url_absoluta(driver, url)
 
 # -----------------------------------------------------------------------------
-# SESSION REQUESTS + RETRIES/POOL
+# SESSION DE REQUESTS CON COOKIES DEL NAVEGADOR
 # -----------------------------------------------------------------------------
 def construir_session_desde_driver(driver):
     s = requests.Session()
+    # User-Agent del navegador real, para mimetizarse
     ua = driver.execute_script("return navigator.userAgent;")
     s.headers.update({
         "User-Agent": ua,
@@ -166,21 +162,20 @@ def construir_session_desde_driver(driver):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "keep-alive",
     })
+    # pasar cookies activas
     for c in driver.get_cookies():
         s.cookies.set(c.get("name"), c.get("value"), domain=c.get("domain"), path=c.get("path", "/"))
     return s
-
-def preparar_session(session: requests.Session) -> requests.Session:
-    retry = Retry(total=3, backoff_factor=0.8, status_forcelist=[429, 503, 502, 504])
-    adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
 
 # -----------------------------------------------------------------------------
 # HELPERS BS4
 # -----------------------------------------------------------------------------
 def bs4_obtener_valor(html_soup: BeautifulSoup, label_text: str) -> str:
+    """
+    Réplica de tu XPath: //div[normalize-space()="label"]/following-sibling::div[1]
+    Busca un <div> cuyo texto normalizado sea label_text y devuelve el texto
+    del siguiente hermano elemento.
+    """
     def _norm(s): return " ".join((s or "").split())
     for div in html_soup.select("div"):
         if _norm(div.get_text()) == label_text:
@@ -192,68 +187,68 @@ def bs4_obtener_valor(html_soup: BeautifulSoup, label_text: str) -> str:
 
 def bs4_obtener_cita_programada(html_soup: BeautifulSoup):
     def _norm(s): return " ".join((s or "").split())
+    # Buscar bloques con clase que contenga 'bg-emerald-50' y texto "Cita programada"
     candidatos = html_soup.select("div.bg-emerald-50, div[class*='bg-emerald-50']")
     for cont in candidatos:
         t = _norm(cont.get_text(" "))
         if "Cita programada" in t:
             return {"cita_fecha": t}
+    # Fallback por si cambian clases pero no el texto
     texto = _norm(html_soup.get_text(" "))
     if "Cita programada" in texto:
         return {"cita_fecha": "Cita programada (detalle no localizado)"}
     return None
+
 # -----------------------------------------------------------------------------
 # DESCARGA + PARSEO DEL EXPEDIENTE
 # -----------------------------------------------------------------------------
-def descargar_y_extraer_expediente(session: requests.Session, url: str):
-    r = session.get(url, timeout=30)
-    if r.status_code in (401, 403):
-        raise PermissionError(f"Sesión expirada o sin permisos al pedir {url}")
-    r.raise_for_status()
+def descargar_y_extraer_expediente(session: requests.Session, url: str, reintentos=3, pausa=0.15):
+    ultimo_error = None
+    for intento in range(reintentos):
+        try:
+            r = session.get(url, timeout=30)
+            if r.status_code in (401, 403):
+                # Sesión expirada: propaga para que el caller regenere cookies si lo desea
+                raise PermissionError(f"Sesión expirada o sin permisos al pedir {url}")
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "lxml")
 
-    soup = BeautifulSoup(r.text, "lxml")
+                # Igual que tu lógica: si no hay cita, se omite
+                cita = bs4_obtener_cita_programada(soup)
+                if not cita:
+                    print("   -> Expediente sin cita programada, omitido")
+                    return None
 
-    cita = bs4_obtener_cita_programada(soup)
-    if not cita:
-        return None
+                datos = {
+                    "numero_cuenta":     bs4_obtener_valor(soup, "Número de cuenta:"),
+                    "nombre":            bs4_obtener_valor(soup, "Nombre:"),
+                    "opcion_titulacion": bs4_obtener_valor(soup, "Opción de titulación:"),
+                    "correo":            bs4_obtener_valor(soup, "Correo electrónico:"),
+                    "plantel":           bs4_obtener_valor(soup, "Plantel:"),
+                    "carrera":           bs4_obtener_valor(soup, "Carrera:"),
+                    "plan_estudios":     bs4_obtener_valor(soup, "Plan de estudios:"),
+                }
+                datos.update(cita)
+                return datos
 
-    datos = {
-        "numero_cuenta":     bs4_obtener_valor(soup, "Número de cuenta:"),
-        "nombre":            bs4_obtener_valor(soup, "Nombre:"),
-        "opcion_titulacion": bs4_obtener_valor(soup, "Opción de titulación:"),
-        "correo":            bs4_obtener_valor(soup, "Correo electrónico:"),
-        "plantel":           bs4_obtener_valor(soup, "Plantel:"),
-        "carrera":           bs4_obtener_valor(soup, "Carrera:"),
-        "plan_estudios":     bs4_obtener_valor(soup, "Plan de estudios:"),
-    }
-    datos.update(cita)
-    return datos
+            if r.status_code in (429, 503):
+                # rate limit/backend ocupado
+                time.sleep(2 * (intento + 1))
+                continue
+
+            r.raise_for_status()
+
+        except Exception as e:
+            ultimo_error = e
+            time.sleep(pausa)
+
+    if isinstance(ultimo_error, PermissionError):
+        raise ultimo_error
+    raise RuntimeError(f"No se pudo descargar {url} después de {reintentos} intentos. Último error: {ultimo_error}")
 
 # -----------------------------------------------------------------------------
-# FASE A: RECOLECTAR TODAS LAS URLs
+# PAGINACIÓN Y RECORRER EXPEDIENTES
 # -----------------------------------------------------------------------------
-def recolectar_urls_expedientes(driver):
-    urls, vistos = [], set()
-    pagina = 1
-    while True:
-        filas = driver.find_elements(*SEL_FILAS)
-        total = len(filas)
-        print(f"\n== Página {pagina}: {total} filas ==")
-
-        for fila in filas:
-            try:
-                url = _obtener_url_expediente_desde_fila(driver, fila)
-                if url not in vistos:
-                    urls.append(url)
-                    vistos.add(url)
-            except Exception as e:
-                print(f"   -> No se pudo derivar URL de una fila: {e}")
-
-        avanzo = _ir_a_siguiente_pagina(driver)
-        if not avanzo:
-            break
-        pagina += 1
-    return urls
-
 def _ir_a_siguiente_pagina(driver, timeout=DEFAULT_TIMEOUT ):
     wait = WebDriverWait(driver, timeout)
 
@@ -289,40 +284,52 @@ def _ir_a_siguiente_pagina(driver, timeout=DEFAULT_TIMEOUT ):
 
     return True
 
-# -----------------------------------------------------------------------------
-# FASE B: PROCESAR EN PARALELO
-# -----------------------------------------------------------------------------
-def procesar_urls_concurrente(session, urls, max_workers=MAX_WORKERS):
-    resultados, omitidos = [], 0
-    session = preparar_session(session)
+def recorrer_expedientes(driver, session: requests.Session):
+    resultados = []
+    omitidos = 0
+    vistos = set()
+    pagina = 1
 
-    def tarea(u):
-        try:
+    while True:
+        filas = driver.find_elements(*SEL_FILAS)
+        total = len(filas)
+        print(f"\n== Página {pagina}: {total} filas ==")
+
+        for i in range(total):
+            filas = driver.find_elements(*SEL_FILAS)
+            fila = filas[i]
+
+            url = _obtener_url_expediente_desde_fila(driver, fila)
+            if url in vistos:
+                continue
+
             try:
-                return descargar_y_extraer_expediente(session, u)
+                datos = descargar_y_extraer_expediente(session, url)
             except PermissionError:
-                # Reintento único por si hubo un hipo temporal con la cookie
-                time.sleep(0.5)
-                return descargar_y_extraer_expediente(session, u)
-        except Exception as e:
-            # Cualquier error duro en este URL
-            print(f"   -> Error en {u}: {e}")
-            return None
+                # Reintenta renovando cookies desde el driver (sesión pudo caducar)
+                print("   -> Sesión caducada al descargar. Renovando cookies…")
+                session = construir_session_desde_driver(driver)
+                datos = descargar_y_extraer_expediente(session, url)
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(tarea, u): u for u in urls}
-        for fut in as_completed(futs):
-            datos = fut.result()
             if datos:
                 resultados.append(datos)
+                vistos.add(url)
             else:
                 omitidos += 1
 
-    return resultados, omitidos
+            # Pausa mínima "amable"
+            time.sleep(0.05)
+
+        avanzo = _ir_a_siguiente_pagina(driver)
+        if not avanzo:
+            break
+        pagina += 1
+
+    print(f"\n-> Expedientes guardados: {len(resultados)} | Omitidos (sin cita): {omitidos}")
+    return resultados
 
 # -----------------------------------------------------------------------------
-# EXPORTAR
+# EXPORTAR A EXCEL
 # -----------------------------------------------------------------------------
 def exportar_excel(resultados, base="expedientes", tz="America/Mexico_City"):
 
@@ -368,109 +375,7 @@ def exportar_excel(resultados, base="expedientes", tz="America/Mexico_City"):
         print(f"-> CSV de respaldo generado: {ruta_csv}")
 
 # -----------------------------------------------------------------------------
-# DETECTOR DE CAMBIOS ENTRE JSONs
-# -----------------------------------------------------------------------------
-def _load_json_list(path: str):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return data
-        return list(data or [])
-    except FileNotFoundError:
-        return []
-    except Exception as e:
-        print(f"-> No se pudo leer {path}: {e}")
-        return []
-
-def _idx_por_clave(resultados):
-    idx = {}
-    for r in resultados:
-        nc = str(r.get("numero_cuenta","")).strip()
-        cf = str(r.get("cita_fecha","")).strip()
-        if not nc:
-            nc = f"__no_nc__::{r.get('nombre','')}::{r.get('plantel','')}"
-        k = (nc, cf or "__sin_cita__")
-        idx[k] = r
-    return idx
-
-def _hash_row_simple(row: dict) -> str:
-    base = {
-        k: row.get(k, "")
-        for k in [
-            "numero_cuenta","nombre","opcion_titulacion","correo",
-            "plantel","carrera","plan_estudios","cita_fecha"
-        ]
-    }
-    canon = json.dumps(base, ensure_ascii=False, sort_keys=True)
-    import hashlib
-    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
-
-def diff_resultados(prev_list, curr_list):
-    prev_idx = _idx_por_clave(prev_list)
-    curr_idx = _idx_por_clave(curr_list)
-
-    prev_keys = set(prev_idx.keys())
-    curr_keys = set(curr_idx.keys())
-
-    nuevos = sorted(list(curr_keys - prev_keys))
-    eliminados = sorted(list(prev_keys - curr_keys))
-
-    actualizados = []
-    for k in (prev_keys & curr_keys):
-        if _hash_row_simple(prev_idx[k]) != _hash_row_simple(curr_idx[k]):
-            actualizados.append(k)
-
-    return {
-        "nuevos": [curr_idx[k] for k in nuevos],
-        "eliminados": [prev_idx[k] for k in eliminados],
-        "actualizados": [curr_idx[k] for k in actualizados],
-    }
-
-def _print_reporte_cambios(rep: dict):
-    hay = bool(rep["nuevos"] or rep["eliminados"] or rep["actualizados"])
-    if not hay:
-        print("-> Sin cambios respecto al snapshot previo.")
-        return
-
-    if rep["nuevos"]:
-        print(f"-> Nuevos registros ({len(rep['nuevos'])}):")
-        for r in rep["nuevos"][:10]:
-            print("   +", r.get("numero_cuenta",""), "|", r.get("nombre",""), "|", r.get("cita_fecha",""))
-
-    if rep["actualizados"]:
-        print(f"-> Registros actualizados ({len(rep['actualizados'])}):")
-        for r in rep["actualizados"][:10]:
-            print("   ~", r.get("numero_cuenta",""), "|", r.get("nombre",""), "|", r.get("cita_fecha",""))
-
-    if rep["eliminados"]:
-        print(f"-> Registros eliminados ({len(rep['eliminados'])}):")
-        for r in rep["eliminados"][:10]:
-            print("   -", r.get("numero_cuenta",""), "|", r.get("nombre",""), "|", r.get("cita_fecha",""))
-
-def detectar_cambios_y_reportar(prev_path: str, curr_path: str):
-    prev_list = _load_json_list(prev_path)
-    curr_list = _load_json_list(curr_path)
-
-    if not prev_list:
-        print("-> No existe snapshot previo; se creará a partir del actual.")
-        try:
-            with open(prev_path, "w", encoding="utf-8") as f:
-                json.dump(curr_list, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            print(f"-> No se pudo escribir {prev_path}: {e}")
-        return
-
-    rep = diff_resultados(prev_list, curr_list)
-    _print_reporte_cambios(rep)
-    try:
-        with open(prev_path, "w", encoding="utf-8") as f:
-            json.dump(curr_list, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        print(f"-> No se pudo actualizar {prev_path}: {e}")
-
-# -----------------------------------------------------------------------------
-# MAIN
+# ESTRUCTURA FINAL
 # -----------------------------------------------------------------------------
 def main():
     options = webdriver.ChromeOptions()
@@ -483,37 +388,21 @@ def main():
     )
     try:
         esperar_login_e_ir_a_seguimiento(driver)
-        seleccionar_filtro_por_estado(driver)
-        print(f"-> Filas visibles: {len(driver.find_elements(*SEL_FILAS_TABLA))}")
-        
-        urls = recolectar_urls_expedientes(driver)
-        print(f"-> Total URLs recolectadas: {len(urls)}")
 
         session = construir_session_desde_driver(driver)
 
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        driver = None
+        seleccionar_filtro_por_estado(driver)
+        print(f"-> Filas visibles: {len(driver.find_elements(*SEL_FILAS_TABLA))}")
 
-        resultados, omitidos = procesar_urls_concurrente(session, urls, max_workers=MAX_WORKERS)
-        print(f"\n-> Expedientes guardados: {len(resultados)} | Omitidos (sin cita/errores): {omitidos}")
-
+        resultados = recorrer_expedientes(driver, session)
         exportar_excel(resultados, base="expedientes")
 
         with open("expedientes.json", "w", encoding="utf-8") as f:
             json.dump(resultados, f, ensure_ascii=False, indent=4)
+
         print("\n-> Datos guardados en expedientes.json")
-
-        detectar_cambios_y_reportar("expedientes_prev.json", "expedientes.json")
-
     finally:
-        if driver is not None:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+        driver.quit()
 
 if __name__ == "__main__":
     main()
