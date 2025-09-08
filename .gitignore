@@ -1,0 +1,8 @@
+/expedientes.json
+/expedientes_prev.json
+/data/*.json
+
+/expedientes-*.xlsx
+/expedientes-*.csv
+
+temp.txt
